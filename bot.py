@@ -1,9 +1,9 @@
 import os
+import json
 import logging
 import re
-import json
 import gspread
-from google.oauth2.service_account import Credentials
+from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes
 from flask import Flask
@@ -12,20 +12,21 @@ from threading import Thread
 # ===== Logging =====
 logging.basicConfig(level=logging.INFO)
 
-# ===== Telegram Token и Google JSON из GitHub Secrets =====
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GOOGLE_JSON = os.environ.get("GOOGLE_JSON")
-GOOGLE_SHEET_ID = "1t31GuGFQc-bQpwtlw4cQM6Eynln1r_vbXVo86Yn8k0E"
-
+# ===== Telegram Token =====
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
     raise ValueError("Не найден секрет TELEGRAM_TOKEN")
+
+# ===== Google Sheets =====
+GOOGLE_SHEET_ID = "1t31GuGFQc-bQpwtlw4cQM6Eynln1r_vbXVo86Yn8k0E"
+GOOGLE_JSON = os.getenv("GOOGLE_JSON")
 if not GOOGLE_JSON:
     raise ValueError("Не найден секрет GOOGLE_JSON")
 
-# ===== Google Sheets =====
-credentials_dict = json.loads(GOOGLE_JSON)
-scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-creds = Credentials.from_service_account_info(credentials_dict, scopes=scopes)
+# Преобразуем JSON строку в объект Python
+SERVICE_ACCOUNT_INFO = json.loads(GOOGLE_JSON)
+scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+creds = ServiceAccountCredentials.from_json_keyfile_dict(SERVICE_ACCOUNT_INFO, scope)
 client = gspread.authorize(creds)
 sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
 
@@ -83,9 +84,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     idx = state["index"]
 
-    # Проверка на выход за пределы вопросов
+    # Если пользователь ответил на все вопросы
     if idx >= len(questions):
-        await update.message.reply_text("Опрос уже завершен. Нажми /start чтобы начать заново.")
+        await update.message.reply_text("Все вопросы уже заданы. Используй /start для новой заявки.")
         return ConversationHandler.END
 
     key = questions[idx]
@@ -97,43 +98,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["data"][key] = text
     state["index"] += 1
 
-    if state["index"] >= len(questions):
-        data = state["data"]
+    # Если остались вопросы — задаём следующий
+    if state["index"] < len(questions):
+        await update.message.reply_text(f"{questions[state['index']]}:")
+        return ASKING
 
-        # ===== Шаблон для менеджера =====
-        client_template = f"""Заявка № {data['Номер заявки']}
-Дата: {data['Дата услуги (ДД.MM.ГГ)']}
-Услуга: {data['Тип услуги']}
-Аэропорт: {data['Аэропорт']}
-Терминал: {data['Терминал']}
-Направление: {data['Направление']}
-Рейс: {data['Номер рейса']}
-Время: {data['Время рейса']}
+    # ===== Все ответы получены =====
+    data = state["data"]
+
+    # ===== Шаблон для менеджера =====
+    client_template = f"""Заявка № {data.get('Номер заявки', '')}
+Дата: {data.get('Дата услуги (ДД.MM.ГГ)', '')}
+Услуга: {data.get('Тип услуги', '')}
+Аэропорт: {data.get('Аэропорт', '')}
+Терминал: {data.get('Терминал', '')}
+Направление: {data.get('Направление', '')}
+Рейс: {data.get('Номер рейса', '')}
+Время: {data.get('Время рейса', '')}
 Пассажиры:
-{data['Пассажиры (через запятую)']}
+{data.get('Пассажиры (через запятую)', '')}
 
-Сумма к оплате: {data['Брутто']} {data['Валюта брутто']}"""
+Сумма к оплате: {data.get('Брутто', '')} {data.get('Валюта брутто', '')}"""
 
-        # ===== Сохраняем в Google Sheets =====
-        row = [
-            data["Manager ID"], data["Manager"], data["Номер заявки"], data["Дата услуги (ДД.MM.ГГ)"], data["Тип услуги"],
-            data["Аэропорт"], data["Терминал"], data["Направление"], data["Номер рейса"], data["Время рейса"],
-            data["Пассажиры (через запятую)"], data["Нетто"], data["Валюта нетто"], data["Дата оплаты поставщику (ДД.MM.ГГ)"],
-            data["Брутто"], data["Валюта брутто"], data["Дата оплаты клиентом (ДД.MM.ГГ)"], data["Способ оплаты клиентом"],
-            data["Способ оплаты поставщику"]
-        ]
-        sheet.append_row(row)
+    # ===== Шаблон для Google Sheets =====
+    sheet_template = "\n".join([data.get(q, "") for q in questions])
 
-        await update.message.reply_text(f"Шаблон для менеджера:\n{client_template}")
-        await update.message.reply_text("Данные сохранены в Google Sheet ✅")
+    await update.message.reply_text(f"Шаблон для менеджера:\n{client_template}")
+    await update.message.reply_text(f"Шаблон для таблицы:\n{sheet_template}")
 
-        del user_data_store[chat_id]
-        return ConversationHandler.END
+    # ===== Сохраняем в Google Sheets =====
+    row = [data.get(q, "") for q in questions]
+    sheet.append_row(row)
 
-    # Следующий вопрос
-    next_key = questions[state["index"]]
-    await update.message.reply_text(f"{next_key}:")
-    return ASKING
+    del user_data_store[chat_id]
+    return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id

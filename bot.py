@@ -1,10 +1,18 @@
-import json
+import os
 import logging
 import re
+import json
 import gspread
 from google.oauth2.service_account import Credentials
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ConversationHandler,
+    ContextTypes
+)
 from flask import Flask
 from threading import Thread
 
@@ -12,44 +20,29 @@ from threading import Thread
 logging.basicConfig(level=logging.INFO)
 
 # ===== Telegram Token =====
-TELEGRAM_TOKEN = "7577113507:AAGFwapwNndVcRQj4ubA0kWF4uGwxptkDrY"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 # ===== Google Sheets =====
 GOOGLE_SHEET_ID = "1t31GuGFQc-bQpwtlw4cQM6Eynln1r_vbXVo86Yn8k0E"
-SERVICE_ACCOUNT_FILE = "pivotal-myth-471918-n5-ead05ba3ff0a.json"
 
-# Авторизация через JSON ключ
-with open(SERVICE_ACCOUNT_FILE, "r", encoding="utf-8") as f:
-    credentials_dict = json.load(f)
+# Используем JSON ключ из переменной окружения
+google_json_str = os.environ.get("GOOGLE_JSON")
+if not google_json_str:
+    raise ValueError("Не найден секрет GOOGLE_JSON")
 
-credentials = Credentials.from_service_account_info(
-    credentials_dict,
-    scopes=["https://www.googleapis.com/auth/spreadsheets"]
-)
-client = gspread.authorize(credentials)
+google_info = json.loads(google_json_str)
+creds = Credentials.from_service_account_info(google_info)
+client = gspread.authorize(creds)
 sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
 
 # ===== Вопросы =====
 questions = [
-    "Manager ID",
-    "Manager",
-    "Номер заявки",
-    "Дата услуги (ДД.MM.ГГ)",
-    "Тип услуги",
-    "Аэропорт",
-    "Терминал",
-    "Направление",
-    "Номер рейса",
-    "Время рейса",
-    "Пассажиры (через запятую)",
-    "Нетто",
-    "Валюта нетто (RUB, USD, EUR)",
-    "Дата оплаты поставщику (ДД.MM.ГГ)",
-    "Брутто",
-    "Валюта брутто",
-    "Дата оплаты клиентом (ДД.MM.ГГ)",
-    "Способ оплаты клиентом",
-    "Способ оплаты поставщику"
+    "Manager ID", "Manager", "Номер заявки", "Дата услуги (ДД.MM.ГГ)",
+    "Тип услуги", "Аэропорт", "Терминал", "Направление",
+    "Номер рейса", "Время рейса", "Пассажиры (через запятую)",
+    "Нетто", "Валюта нетто (RUB, USD, EUR)", "Дата оплаты поставщику (ДД.MM.ГГ)",
+    "Брутто", "Валюта брутто", "Дата оплаты клиентом (ДД.MM.ГГ)",
+    "Способ оплаты клиентом", "Способ оплаты поставщику"
 ]
 
 ASKING = 0
@@ -110,17 +103,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Сумма к оплате: {data['Брутто']} {data['Валюта брутто']}"""
 
         # ===== Шаблон для Google Sheets =====
+        sheet_template = f"""Manager ID: {data['Manager ID']}
+Manager: {data['Manager']}
+Заявка № {data['Номер заявки']}
+Дата: {data['Дата услуги (ДД.MM.ГГ)']}
+Услуга: {data['Тип услуги']}
+Аэропорт: {data['Аэропорт']}
+Терминал: {data['Терминал']}
+Направление: {data['Направление']}
+Рейс: {data['Номер рейса']}
+Время: {data['Время рейса']}
+Пассажиры:
+{data['Пассажиры (через запятую)']}
+
+Брутто: {data['Брутто']} {data['Валюта брутто']}
+Нетто: {data['Нетто']} {data['Валюта нетто']}
+
+Дата оплаты клиентом: {data['Дата оплаты клиентом (ДД.MM.ГГ)']}
+Куда оплатил клиент: {data['Способ оплаты клиентом']}
+Дата оплаты поставщику: {data['Дата оплаты поставщику (ДД.MM.ГГ)']}
+Как оплатили поставщику: {data['Способ оплаты поставщику']}"""
+
+        await update.message.reply_text(f"Шаблон для менеджера:\n{client_template}")
+        await update.message.reply_text(f"Шаблон для таблицы:\n{sheet_template}")
+
+        # ===== Сохраняем в Google Sheets =====
         row = [
             data["Manager ID"], data["Manager"], data["Номер заявки"], data["Дата услуги (ДД.MM.ГГ)"], data["Тип услуги"],
             data["Аэропорт"], data["Терминал"], data["Направление"], data["Номер рейса"], data["Время рейса"],
-            data["Пассажиры (через запятую)"], data["Нетто"], data["Валюта нетто (RUB, USD, EUR)"], data["Дата оплаты поставщику (ДД.MM.ГГ)"],
+            data["Пассажиры (через запятую)"], data["Нетто"], data["Валюта нетто"], data["Дата оплаты поставщику (ДД.MM.ГГ)"],
             data["Брутто"], data["Валюта брутто"], data["Дата оплаты клиентом (ДД.MM.ГГ)"], data["Способ оплаты клиентом"],
             data["Способ оплаты поставщику"]
         ]
         sheet.append_row(row)
-
-        await update.message.reply_text(f"Шаблон для менеджера:\n{client_template}")
-        await update.message.reply_text("Данные успешно сохранены в Google Sheets ✅")
 
         del user_data_store[chat_id]
         return ConversationHandler.END

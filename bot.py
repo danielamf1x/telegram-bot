@@ -3,21 +3,23 @@ import re
 import json
 import gspread
 from google.oauth2.service_account import Credentials
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    filters, ConversationHandler, ContextTypes, CallbackQueryHandler
+    Application, CommandHandler, MessageHandler, filters,
+    ConversationHandler, CallbackQueryHandler, ContextTypes
 )
 
-# ========= Настройки ==========
+# ===== Настройки =====
 GOOGLE_SHEET_ID = "1t31GuGFQc-bQpwtlw4cQM6Eynln1r_vbXVo86Yn8k0E"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
+# Загружаем JSON ключ из Secrets
 google_creds_json = os.getenv("GOOGLE_JSON")
 if not google_creds_json:
     raise ValueError("Не найден секрет GOOGLE_JSON")
 creds_dict = json.loads(google_creds_json)
 
+# Авторизация Google Sheets
 creds = Credentials.from_service_account_info(
     creds_dict,
     scopes=["https://www.googleapis.com/auth/spreadsheets"]
@@ -25,7 +27,7 @@ creds = Credentials.from_service_account_info(
 client = gspread.authorize(creds)
 sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
 
-# ========= Вопросы ==========
+# ===== Вопросы =====
 questions = [
     "Manager ID",
     "Manager",
@@ -36,7 +38,7 @@ questions = [
     "Терминал",
     "Направление",
     "Номер рейса",
-    "Время рейса (ЧЧ:ММ/ЧЧ:ММ)",
+    "Время рейса",
     "Пассажиры (через запятую)",
     "Нетто",
     "Валюта нетто (RUB, USD, EUR)",
@@ -50,57 +52,51 @@ questions = [
 
 ASKING, CONFIRM = range(2)
 
-# ========= Вспомогательные функции ==========
-def get_next_available_number(prefix="ДЮ-"):
+# ===== Функции =====
+def next_available_number(number_prefix):
     rows = sheet.get_all_values()[1:]
-    numbers = [int(re.search(r"\d+$", r[2]).group()) for r in rows if re.match(rf"{prefix}\d+$", r[2])]
-    return f"{prefix}{max(numbers)+1 if numbers else 1}"
+    numbers = [row[2] for row in rows if row]
+    match = re.match(r"([^\d]*)(\d+)$", number_prefix)
+    if match:
+        prefix, num = match.groups()
+        num = int(num)
+        while f"{prefix}{num}" in numbers:
+            num += 1
+        return f"{prefix}{num}"
+    return number_prefix
 
-def format_input(text):
-    return text.strip() if text.strip() else "-"
-
-# ========= Handlers ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
     context.user_data["answers"] = {}
     context.user_data["idx"] = 0
-    msg = await update.message.reply_text(f"{questions[0]} (если неизвестно, ставь '-')")
-    context.user_data["last_msg"] = msg
+    await update.message.reply_text(f"Привет! Давай заполним заявку.\n{questions[0]} (если неизвестно, ставь '-')")
     return ASKING
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     idx = context.user_data["idx"]
     answers = context.user_data["answers"]
-    text = format_input(update.message.text)
-
-    # Удаляем вопрос после ответа
-    try: await context.user_data["last_msg"].delete()
-    except: pass
-    try: await update.message.delete()
-    except: pass
+    text = update.message.text.strip() or "-"
 
     # Проверка дубликата номера заявки
     if questions[idx] == "Номер заявки":
-        rows = sheet.get_all_values()[1:]
-        existing_numbers = [r[2] for r in rows if r]
-        if text in existing_numbers:
-            text = get_next_available_number()
-            msg = await update.message.reply_text(f"⚠️ Такой номер уже есть. Используем следующий: {text}")
-            context.user_data["last_msg"] = msg
+        text = next_available_number(text)
+        await update.message.reply_text(f"Предлагаю использовать доступный номер заявки: {text}")
 
     answers[questions[idx]] = text
     idx += 1
 
     if idx < len(questions):
         context.user_data["idx"] = idx
-        msg = await update.message.reply_text(f"{questions[idx]} (если неизвестно, ставь '-')")
-        context.user_data["last_msg"] = msg
+        await update.message.reply_text(f"{questions[idx]} (если неизвестно, ставь '-')")
         return ASKING
     else:
+        # Удаляем предыдущие сообщения вопросов
+        if update.message:
+            await update.message.delete()
         return await show_summary(update, context)
 
 async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data["answers"]
+    passengers = data["Пассажиры (через запятую)"].replace(",", "\n")
 
     sms_manager = (
         f"Заявка № {data['Номер заявки']}\n"
@@ -110,8 +106,8 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Терминал: {data['Терминал']}\n"
         f"Направление: {data['Направление']}\n"
         f"Рейс: {data['Номер рейса']}\n"
-        f"Время: {data['Время рейса (ЧЧ:ММ/ЧЧ:ММ)']}\n"
-        f"Пассажиры:\n{data['Пассажиры (через запятую)'].replace(',', '\n')}\n\n"
+        f"Время: {data['Время рейса']}\n"
+        f"Пассажиры:\n{passengers}\n\n"
         f"Сумма к оплате: {data['Брутто']} {data['Валюта брутто']}"
     )
 
@@ -125,10 +121,10 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Терминал: {data['Терминал']}\n"
         f"Направление: {data['Направление']}\n"
         f"Рейс: {data['Номер рейса']}\n"
-        f"Время: {data['Время рейса (ЧЧ:ММ/ЧЧ:ММ)']}\n"
-        f"Пассажиры:\n{data['Пассажиры (через запятую)'].replace(',', '\n')}\n\n"
+        f"Время: {data['Время рейса']}\n"
+        f"Пассажиры:\n{passengers}\n\n"
         f"Брутто: {data['Брутто']} {data['Валюта брутто']}\n"
-        f"Нетто: {data['Нетто']} {data['Валюта нетто (RUB, USD, EUR)']}\n\n"
+        f"Нетто: {data['Нетто']} {data['Валюта нетто (RUB, USD, EUR)']}\n"
         f"Дата оплаты клиентом: {data['Дата оплаты клиентом (ДД.MM.ГГ)']}\n"
         f"Куда оплатил клиент: {data['Способ оплаты клиентом']}\n"
         f"Дата оплаты поставщику: {data['Дата оплаты поставщику (ДД.MM.ГГ)']}\n"
@@ -143,23 +139,31 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✏️ Редактировать", callback_data="edit")]
     ]
     msg = await update.message.reply_text(
-        f"📩 СМС менеджеру:\n{sms_manager}\n\n📩 СМС в таблицу:\n{sms_table}",
+        f"📩 СМС менеджеру:\n{sms_manager}\n\n📩 СМС для таблицы:\n{sms_table}",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-    context.user_data["last_msg"] = msg
+    # Сохраняем ID сообщения, чтобы при редактировании удалить его
+    context.user_data["summary_msg_id"] = msg.message_id
     return CONFIRM
 
 async def confirm_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "confirm":
-        row = [context.user_data["answers"].get(q, "-") for q in questions]
+        data = context.user_data["answers"]
+        row = [data[q] for q in questions]
         sheet.append_row(row)
         await query.edit_message_text("✅ Заявка сохранена и отправлена в таблицу.")
+        context.user_data.clear()
         return ConversationHandler.END
     elif query.data == "edit":
-        keyboard = [[InlineKeyboardButton(q, callback_data=f"edit_{i}")] for i, q in enumerate(questions)]
-        await query.edit_message_text("Что хочешь отредактировать?", reply_markup=InlineKeyboardMarkup(keyboard))
+        keyboard = [
+            [InlineKeyboardButton(q, callback_data=f"edit_{i}")] for i, q in enumerate(questions)
+        ]
+        await query.edit_message_text(
+            "Выберите поле для редактирования:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return CONFIRM
 
 async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -167,53 +171,71 @@ async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     idx = int(query.data.split("_")[1])
     context.user_data["edit_idx"] = idx
-    msg = await query.edit_message_text(f"Введи новое значение для: {questions[idx]} (если неизвестно, ставь '-')")
-    context.user_data["last_msg"] = msg
+    # Удаляем предыдущие сообщения вопросов
+    if context.user_data.get("summary_msg_id"):
+        try:
+            await query.message.delete()
+        except:
+            pass
+    await query.message.reply_text(f"Введите новое значение для: {questions[idx]}")
     return ASKING
 
 async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    idx = context.user_data.get("edit_idx")
-    if idx is not None:
-        text = format_input(update.message.text)
-        context.user_data["answers"][questions[idx]] = text
+    idx = context.user_data["edit_idx"]
+    text = update.message.text.strip() or "-"
+    context.user_data["answers"][questions[idx]] = text
+    # Удаляем сообщение с редактированием
+    try:
+        await update.message.delete()
+    except:
+        pass
     return await show_summary(update, context)
 
-# ===== Просмотр предыдущих заявок =====
+# ===== Просмотр заявок =====
 async def list_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = sheet.get_all_values()[1:]
     if not rows:
         await update.message.reply_text("Заявок пока нет.")
         return
-    keyboard = [[InlineKeyboardButton(f"{r[2]} / {r[1]}", callback_data=f"req_{r[2]}")] for r in rows[-10:]]
+    keyboard = [
+        [InlineKeyboardButton(f"{r[2]} / {r[1]}", callback_data=f"req_{r[2]}")] for r in rows[-10:]
+    ]
     await update.message.reply_text("📋 Последние заявки:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    num = query.data.split("_")[1]
+    num = query.data.split("_", 1)[1]
     rows = sheet.get_all_values()[1:]
     for r in rows:
         if r[2] == num:
+            passengers = r[10].replace(",", "\n")
             sms_manager = (
-                f"Заявка № {r[2]}\nДата: {r[3]}\nУслуга: {r[4]}\nАэропорт: {r[5]}\n"
-                f"Терминал: {r[6]}\nНаправление: {r[7]}\nРейс: {r[8]}\nВремя: {r[9]}\n"
-                f"Пассажиры:\n{r[10].replace(',', '\n')}\n\nСумма к оплате: {r[15]} {r[16]}"
+                f"Заявка № {r[2]}\n"
+                f"Дата: {r[3]}\n"
+                f"Услуга: {r[4]}\n"
+                f"Аэропорт: {r[5]}\n"
+                f"Терминал: {r[6]}\n"
+                f"Направление: {r[7]}\n"
+                f"Рейс: {r[8]}\n"
+                f"Время: {r[9]}\n"
+                f"Пассажиры:\n{passengers}\n\n"
+                f"Сумма к оплате: {r[14]} {r[15]}"
             )
             sms_table = (
                 f"Manager ID: {r[0]}\nManager: {r[1]}\nЗаявка № {r[2]}\nДата: {r[3]}\n"
                 f"Услуга: {r[4]}\nАэропорт: {r[5]}\nТерминал: {r[6]}\nНаправление: {r[7]}\n"
-                f"Рейс: {r[8]}\nВремя: {r[9]}\nПассажиры:\n{r[10].replace(',', '\n')}\n\n"
-                f"Брутто: {r[15]} {r[16]}\nНетто: {r[11]} {r[12]}\n"
-                f"Дата оплаты клиентом: {r[17]}\nКуда оплатил клиент: {r[18]}\n"
-                f"Дата оплаты поставщику: {r[13]}\nКак оплатили поставщику: {r[19]}"
+                f"Рейс: {r[8]}\nВремя: {r[9]}\nПассажиры:\n{passengers}\n\n"
+                f"Брутто: {r[14]} {r[15]}\nНетто: {r[11]} {r[12]}\n"
+                f"Дата оплаты клиентом: {r[16]}\nКуда оплатил клиент: {r[17]}\n"
+                f"Дата оплаты поставщику: {r[13]}\nКак оплатили поставщику: {r[18]}"
             )
-            await query.edit_message_text(f"📩 СМС менеджеру:\n{sms_manager}\n\n📩 СМС в таблицу:\n{sms_table}")
+            await query.edit_message_text(f"📩 СМС менеджеру:\n{sms_manager}\n\n📩 СМС для таблицы:\n{sms_table}")
             return
 
-# ========= Основное ==========
+# ===== Основное =====
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -226,10 +248,8 @@ def main():
                 CallbackQueryHandler(edit_field, pattern="^edit_\\d+$")
             ]
         },
-        fallbacks=[CommandHandler("start", start)],
-        per_message=True
+        fallbacks=[CommandHandler("start", start)]
     )
-
     app.add_handler(conv)
     app.add_handler(CommandHandler("list", list_requests))
     app.add_handler(CallbackQueryHandler(show_request, pattern="^req_"))

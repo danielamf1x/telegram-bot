@@ -50,7 +50,6 @@ questions = [
 ASKING, CONFIRM = range(2)
 
 # ========= Функции ==========
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"] = {}
     context.user_data["idx"] = 0
@@ -59,13 +58,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ASKING
 
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    idx = context.user_data["idx"]
-    answers = context.user_data["answers"]
+    idx = context.user_data.get("idx", 0)
+    answers = context.user_data.get("answers", {})
     text = update.message.text.strip()
 
-    # === Проверка дубликата номера заявки ===
+    # Проверка дубликата номера заявки
     if questions[idx] == "Номер заявки":
         existing_numbers = [row[0] for row in sheet.get_all_values()[1:] if row]
         if text in existing_numbers:
@@ -79,8 +77,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = suggested
 
     answers[questions[idx]] = text
-
     idx += 1
+
     if idx < len(questions):
         context.user_data["idx"] = idx
         await update.message.reply_text(
@@ -89,7 +87,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASKING
     else:
         return await show_summary(update, context)
-
 
 async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data["answers"]
@@ -124,7 +121,6 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return CONFIRM
 
-
 async def confirm_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -147,26 +143,21 @@ async def confirm_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return CONFIRM
 
-
 async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     idx = int(query.data.split("_")[1])
     context.user_data["edit_idx"] = idx
-    await query.edit_message_text(
-        f"Введи новое значение для: {questions[idx]}"
-    )
+    await query.edit_message_text(f"Введи новое значение для: {questions[idx]}")
     return ASKING
 
-
 async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    idx = context.user_data["edit_idx"]
-    context.user_data["answers"][questions[idx]] = update.message.text.strip()
+    idx = context.user_data.get("edit_idx")
+    if idx is not None:
+        context.user_data["answers"][questions[idx]] = update.message.text.strip()
     return await show_summary(update, context)
 
-
-# === Список заявок ===
+# ===== Просмотр предыдущих заявок =====
 async def list_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = sheet.get_all_values()[1:]
     if not rows:
@@ -183,11 +174,9 @@ async def list_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-
 async def show_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     num = query.data.split("_", 1)[1]
     rows = sheet.get_all_values()[1:]
     for r in rows:
@@ -207,7 +196,6 @@ async def show_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-
 # ========= Основное ==========
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -225,6 +213,7 @@ def main():
             ]
         },
         fallbacks=[CommandHandler("start", start)],
+        per_message=True  # 👈 добавлено для устранения предупреждения
     )
 
     app.add_handler(conv)
@@ -232,7 +221,6 @@ def main():
     app.add_handler(CallbackQueryHandler(show_request, pattern="^req_"))
 
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()

@@ -50,7 +50,7 @@ questions = [
     "Способ оплаты поставщику"
 ]
 
-ASKING, CONFIRM = range(2)
+ASKING, CONFIRM, EDITING = range(3)
 
 # ===== Функции =====
 def next_available_number(number_prefix):
@@ -68,7 +68,9 @@ def next_available_number(number_prefix):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"] = {}
     context.user_data["idx"] = 0
-    await update.message.reply_text(f"Привет! Давай заполним заявку.\n{questions[0]} (если неизвестно, ставь '-')")
+    context.user_data["msg_ids"] = []
+    msg = await update.message.reply_text(f"Привет! Давай заполним заявку.\n{questions[0]} (если неизвестно, ставь '-')")
+    context.user_data["msg_ids"].append(msg.message_id)
     return ASKING
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -79,19 +81,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Проверка дубликата номера заявки
     if questions[idx] == "Номер заявки":
         text = next_available_number(text)
-        await update.message.reply_text(f"Предлагаю использовать доступный номер заявки: {text}")
+        msg = await update.message.reply_text(f"Предлагаю использовать доступный номер заявки: {text}")
+        context.user_data["msg_ids"].append(msg.message_id)
 
     answers[questions[idx]] = text
-    idx += 1
+    context.user_data["idx"] = idx + 1
+    msg_id = update.message.message_id
+    context.user_data["msg_ids"].append(msg_id)
 
-    if idx < len(questions):
-        context.user_data["idx"] = idx
-        await update.message.reply_text(f"{questions[idx]} (если неизвестно, ставь '-')")
+    if context.user_data["idx"] < len(questions):
+        msg = await update.message.reply_text(f"{questions[context.user_data['idx']]} (если неизвестно, ставь '-')")
+        context.user_data["msg_ids"].append(msg.message_id)
         return ASKING
     else:
-        # Удаляем предыдущие сообщения вопросов
-        if update.message:
-            await update.message.delete()
+        # Удаляем все сообщения с вопросами
+        for mid in context.user_data.get("msg_ids", []):
+            try:
+                await update.message.chat.delete_message(mid)
+            except:
+                pass
         return await show_summary(update, context)
 
 async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -142,7 +150,6 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📩 СМС менеджеру:\n{sms_manager}\n\n📩 СМС для таблицы:\n{sms_table}",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-    # Сохраняем ID сообщения, чтобы при редактировании удалить его
     context.user_data["summary_msg_id"] = msg.message_id
     return CONFIRM
 
@@ -171,24 +178,14 @@ async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     idx = int(query.data.split("_")[1])
     context.user_data["edit_idx"] = idx
-    # Удаляем предыдущие сообщения вопросов
-    if context.user_data.get("summary_msg_id"):
-        try:
-            await query.message.delete()
-        except:
-            pass
     await query.message.reply_text(f"Введите новое значение для: {questions[idx]}")
-    return ASKING
+    return EDITING
 
 async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     idx = context.user_data["edit_idx"]
     text = update.message.text.strip() or "-"
     context.user_data["answers"][questions[idx]] = text
-    # Удаляем сообщение с редактированием
-    try:
-        await update.message.delete()
-    except:
-        pass
+    await update.message.delete()
     return await show_summary(update, context)
 
 # ===== Просмотр заявок =====
@@ -239,10 +236,8 @@ def main():
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            ASKING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit)
-            ],
+            ASKING: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)],
+            EDITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit)],
             CONFIRM: [
                 CallbackQueryHandler(confirm_or_edit, pattern="^(confirm|edit)$"),
                 CallbackQueryHandler(edit_field, pattern="^edit_\\d+$")

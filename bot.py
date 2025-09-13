@@ -1,252 +1,238 @@
 import os
-import json
-import logging
 import re
+import json
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from google.oauth2.service_account import Credentials
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
+    Application, CommandHandler, MessageHandler,
     filters, ConversationHandler, ContextTypes, CallbackQueryHandler
 )
-from flask import Flask
-from threading import Thread
-import asyncio
 
-# ===== Logging =====
-logging.basicConfig(level=logging.INFO)
-
-# ===== Telegram Token =====
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-if not TELEGRAM_TOKEN:
-    raise ValueError("Не найден секрет TELEGRAM_TOKEN")
-
-# ===== Google Sheets =====
+# ========= Настройки ==========
 GOOGLE_SHEET_ID = "1t31GuGFQc-bQpwtlw4cQM6Eynln1r_vbXVo86Yn8k0E"
-GOOGLE_JSON = os.getenv("GOOGLE_JSON")
-if not GOOGLE_JSON:
-    raise ValueError("Не найден секрет GOOGLE_JSON")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-SERVICE_ACCOUNT_INFO = json.loads(GOOGLE_JSON)
-scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-creds = ServiceAccountCredentials.from_json_keyfile_dict(SERVICE_ACCOUNT_INFO, scope)
+# Загружаем JSON ключ из Secrets
+google_creds_json = os.getenv("GOOGLE_JSON")
+if not google_creds_json:
+    raise ValueError("Не найден секрет GOOGLE_JSON")
+creds_dict = json.loads(google_creds_json)
+
+# Авторизация Google Sheets
+creds = Credentials.from_service_account_info(
+    creds_dict,
+    scopes=["https://www.googleapis.com/auth/spreadsheets"]
+)
 client = gspread.authorize(creds)
 sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
 
-# ===== Вопросы =====
+# ========= Вопросы ==========
 questions = [
-    "Manager ID",
-    "Manager",
     "Номер заявки",
-    "Дата услуги (ДД.MM.ГГ)",
-    "Тип услуги",
-    "Аэропорт",
-    "Терминал",
-    "Направление",
-    "Номер рейса",
-    "Время рейса",
+    "Manager",
+    "Клиент",
+    "Услуга",
     "Пассажиры (через запятую)",
     "Нетто",
-    "Валюта нетто (RUB, USD, EUR)",
+    "Валюта нетто",
     "Дата оплаты поставщику (ДД.MM.ГГ)",
-    "Брутто",
-    "Валюта брутто",
-    "Дата оплаты клиентом (ДД.MM.ГГ)",
-    "Способ оплаты клиентом",
-    "Способ оплаты поставщику"
+    "Комиссия",
+    "Валюта комиссии",
+    "Маржа",
+    "Валюта маржи",
+    "Итого",
+    "Валюта итого",
+    "Дата услуги (ДД.MM.ГГ)",
+    "Дата оплаты клиента (ДД.MM.ГГ)"
 ]
 
-ASKING, REVIEW = range(2)
-user_data_store = {}
+ASKING, CONFIRM = range(2)
 
-# ===== Валидация =====
-def validate(key, text):
-    if text.strip() == "-":
-        return True
-    if "Дата" in key:
-        return bool(re.match(r"^(\d{2}\.\d{2}\.\d{2}|\-)$", text))
-    if "Брутто" in key or "Нетто" in key:
-        return bool(re.match(r"\d+([.,]\d{1,2})?$", text))
-    if "валюта" in key.lower():
-        return bool(re.match(r"[A-Z]{3}$", text))
-    return True
+# ========= Функции ==========
 
-# ===== Проверка дубликата номера заявки =====
-def check_duplicate_request(request_number: str):
-    try:
-        values = sheet.col_values(3)  # 3-й столбец = "Номер заявки"
-        if request_number in values:
-            prefix, num = request_number.split("-")
-            suggested = f"{prefix}-{int(num) + 1}"
-            return suggested
-    except Exception as e:
-        logging.error(f"Ошибка при проверке дубликата: {e}")
-    return None
-
-# ===== Handlers =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    user_data_store[chat_id] = {"index": 0, "data": {}, "messages": []}
-
-    msg = await update.message.reply_text(f"Привет! Давай заполним заявку.\n{questions[0]} (если неизвестно, ставь '-'):")
-    user_data_store[chat_id]["messages"].append(msg)
-
+    context.user_data["answers"] = {}
+    context.user_data["idx"] = 0
+    await update.message.reply_text(
+        f"Привет! Давай заполним заявку.\n\n{questions[0]} (если неизвестно, ставь '-')"
+    )
     return ASKING
 
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
+    idx = context.user_data["idx"]
+    answers = context.user_data["answers"]
     text = update.message.text.strip()
-    state = user_data_store.get(chat_id)
 
-    if state is None:
-        await update.message.reply_text("Нажми /start чтобы начать.")
+    # === Проверка дубликата номера заявки ===
+    if questions[idx] == "Номер заявки":
+        existing_numbers = [row[0] for row in sheet.get_all_values()[1:] if row]
+        if text in existing_numbers:
+            match = re.match(r"([^\d]*)(\d+)$", text)
+            if match:
+                prefix, num = match.groups()
+                suggested = f"{prefix}{int(num) + 1}"
+                await update.message.reply_text(
+                    f"⚠️ Такой номер уже есть в таблице!\nПредлагаю использовать следующий: {suggested}"
+                )
+                text = suggested
+
+    answers[questions[idx]] = text
+
+    idx += 1
+    if idx < len(questions):
+        context.user_data["idx"] = idx
+        await update.message.reply_text(
+            f"{questions[idx]} (если неизвестно, ставь '-')"
+        )
         return ASKING
+    else:
+        return await show_summary(update, context)
 
-    idx = state["index"]
 
-    if idx >= len(questions):
-        return REVIEW
+async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data["answers"]
 
-    key = questions[idx]
+    sms_manager = (
+        f"Заявка {data['Номер заявки']} для клиента {data['Клиент']} "
+        f"услуга {data['Услуга']} дата {data['Дата услуги (ДД.MM.ГГ)']}."
+    )
 
-    # Проверка формата
-    if not validate(key, text):
-        msg = await update.message.reply_text(f"Некорректный формат для '{key}'. Попробуй ещё раз:")
-        state["messages"].append(msg)
-        return ASKING
+    sms_table = (
+        f"Заявка {data['Номер заявки']}, менеджер {data['Manager']}, "
+        f"пассажиры: {data['Пассажиры (через запятую)']}, "
+        f"нетто {data['Нетто']} {data['Валюта нетто']}, "
+        f"комиссия {data['Комиссия']} {data['Валюта комиссии']}, "
+        f"маржа {data['Маржа']} {data['Валюта маржи']}, "
+        f"итого {data['Итого']} {data['Валюта итого']}, "
+        f"дата услуги {data['Дата услуги (ДД.MM.ГГ)']}, "
+        f"оплата клиента {data['Дата оплаты клиента (ДД.MM.ГГ)']}, "
+        f"оплата поставщику {data['Дата оплаты поставщику (ДД.MM.ГГ)']}."
+    )
 
-    # Проверка дубликата для "Номер заявки"
-    if key == "Номер заявки":
-        suggestion = check_duplicate_request(text)
-        if suggestion:
-            msg = await update.message.reply_text(f"❌ Такой номер уже есть! Предлагаю использовать: {suggestion}")
-            state["messages"].append(msg)
-            return ASKING
+    context.user_data["sms_manager"] = sms_manager
+    context.user_data["sms_table"] = sms_table
 
-    state["data"][key] = text
-    state["index"] += 1
+    keyboard = [
+        [InlineKeyboardButton("✅ Подтвердить", callback_data="confirm")],
+        [InlineKeyboardButton("✏️ Редактировать", callback_data="edit")]
+    ]
+    await update.message.reply_text(
+        f"📩 СМС менеджеру:\n{sms_manager}\n\n📩 СМС в таблицу:\n{sms_table}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CONFIRM
 
-    # Если остались вопросы
-    if state["index"] < len(questions):
-        msg = await update.message.reply_text(f"{questions[state['index']]} (если неизвестно, ставь '-'):")
-        state["messages"].append(msg)
 
-        # Удаляем старые вопросы через 10 секунд
-        for m in state["messages"]:
-            asyncio.create_task(delete_message(update, context, m))
-        state["messages"].clear()
-
-        return ASKING
-
-    # ===== Все ответы получены =====
-    data = state["data"]
-
-    client_template = f"""Заявка № {data.get('Номер заявки', '')}
-Дата: {data.get('Дата услуги (ДД.MM.ГГ)', '')}
-Услуга: {data.get('Тип услуги', '')}
-Аэропорт: {data.get('Аэропорт', '')}
-Терминал: {data.get('Терминал', '')}
-Направление: {data.get('Направление', '')}
-Рейс: {data.get('Номер рейса', '')}
-Время: {data.get('Время рейса', '')}
-Пассажиры:
-{data.get('Пассажиры (через запятую)', '')}
-
-Сумма к оплате: {data.get('Брутто', '')} {data.get('Валюта брутто', '')}"""
-
-    await update.message.reply_text(f"📋 Проверь заявку:\n{client_template}",
-                                    reply_markup=InlineKeyboardMarkup([
-                                        [InlineKeyboardButton("✅ Подтвердить", callback_data="confirm")],
-                                        [InlineKeyboardButton("✏️ Изменить", callback_data="edit")]
-                                    ]))
-
-    return REVIEW
-
-async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def confirm_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    chat_id = query.message.chat_id
-    state = user_data_store.get(chat_id)
     await query.answer()
 
     if query.data == "confirm":
-        row = [state["data"].get(q, "") for q in questions]
+        data = context.user_data["answers"]
+        row = [data[q] for q in questions]
         sheet.append_row(row)
-        await query.edit_message_text("✅ Заявка сохранена в Google Sheets!")
-        del user_data_store[chat_id]
+        await query.edit_message_text("✅ Заявка сохранена и отправлена в таблицу.")
         return ConversationHandler.END
 
     elif query.data == "edit":
-        await query.edit_message_text("✏️ Выбери, что редактировать:",
-                                      reply_markup=InlineKeyboardMarkup([
-                                          [InlineKeyboardButton(q, callback_data=f"edit_{i}")]
-                                          for i, q in enumerate(questions)
-                                      ]))
-        return REVIEW
+        keyboard = [
+            [InlineKeyboardButton(q, callback_data=f"edit_{i}")]
+            for i, q in enumerate(questions)
+        ]
+        await query.edit_message_text(
+            "Что хочешь отредактировать?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return CONFIRM
 
-    elif query.data.startswith("edit_"):
-        idx = int(query.data.split("_")[1])
-        state["index"] = idx
-        await query.edit_message_text(f"Измени поле: {questions[idx]} (если неизвестно, ставь '-'):")
-        return ASKING
 
-# ===== Просмотр списка заявок =====
+async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    idx = int(query.data.split("_")[1])
+    context.user_data["edit_idx"] = idx
+    await query.edit_message_text(
+        f"Введи новое значение для: {questions[idx]}"
+    )
+    return ASKING
+
+
+async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    idx = context.user_data["edit_idx"]
+    context.user_data["answers"][questions[idx]] = update.message.text.strip()
+    return await show_summary(update, context)
+
+
+# === Список заявок ===
 async def list_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        values = sheet.get_all_values()
-        if not values or len(values) < 2:
-            await update.message.reply_text("Пока нет заявок.")
-            return
+    rows = sheet.get_all_values()[1:]
+    if not rows:
+        await update.message.reply_text("Заявок пока нет.")
+        return
 
-        last_10 = values[-10:]
-        text = "📑 Последние заявки:\n\n"
-        for row in last_10:
-            try:
-                text += f"№ {row[2]} | {row[3]} | {row[4]} | {row[10]}\n"
-            except IndexError:
-                continue
+    keyboard = []
+    for r in rows[-10:]:
+        num, mgr, *_ , date = r[0], r[1], *r[2:], r[14]
+        keyboard.append([InlineKeyboardButton(f"{num} / {mgr} / {date}", callback_data=f"req_{num}")])
 
-        await update.message.reply_text(text)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка при получении заявок: {e}")
-
-# ===== Удаление сообщений =====
-async def delete_message(update: Update, context: ContextTypes.DEFAULT_TYPE, msg):
-    try:
-        await asyncio.sleep(10)
-        await context.bot.delete_message(chat_id=update.message.chat_id, message_id=msg.message_id)
-    except:
-        pass
-
-# ===== Flask для Railway (24/7) =====
-flask_app = Flask('')
-
-@flask_app.route('/')
-def home():
-    return "Bot is running"
-
-def run_flask():
-    flask_app.run(host='0.0.0.0', port=8080)
-
-Thread(target=run_flask).start()
-
-# ===== Основная функция =====
-def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
-        states={
-            ASKING: [MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)],
-            REVIEW: [CallbackQueryHandler(review)]
-        },
-        fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+    await update.message.reply_text(
+        "📋 Последние заявки:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-    app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("list", list_requests))
 
-    print("Бот запущен...")
+async def show_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    num = query.data.split("_", 1)[1]
+    rows = sheet.get_all_values()[1:]
+    for r in rows:
+        if r[0] == num:
+            sms_manager = (
+                f"Заявка {r[0]} для клиента {r[2]} услуга {r[3]} дата {r[14]}."
+            )
+            sms_table = (
+                f"Заявка {r[0]}, менеджер {r[1]}, пассажиры: {r[4]}, "
+                f"нетто {r[5]} {r[6]}, комиссия {r[8]} {r[9]}, "
+                f"маржа {r[10]} {r[11]}, итого {r[12]} {r[13]}, "
+                f"дата услуги {r[14]}, оплата клиента {r[15]}, "
+                f"оплата поставщику {r[7]}."
+            )
+            await query.edit_message_text(
+                f"📩 СМС менеджеру:\n{sms_manager}\n\n📩 СМС в таблицу:\n{sms_table}"
+            )
+            return
+
+
+# ========= Основное ==========
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            ASKING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit)
+            ],
+            CONFIRM: [
+                CallbackQueryHandler(confirm_or_edit, pattern="^(confirm|edit)$"),
+                CallbackQueryHandler(edit_field, pattern="^edit_\\d+$")
+            ]
+        },
+        fallbacks=[CommandHandler("start", start)],
+    )
+
+    app.add_handler(conv)
+    app.add_handler(CommandHandler("list", list_requests))
+    app.add_handler(CallbackQueryHandler(show_request, pattern="^req_"))
+
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()

@@ -13,13 +13,12 @@ from telegram.ext import (
 GOOGLE_SHEET_ID = "1t31GuGFQc-bQpwtlw4cQM6Eynln1r_vbXVo86Yn8k0E"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Загружаем JSON ключ из Secrets
+# Загружаем JSON ключ
 google_creds_json = os.getenv("GOOGLE_JSON")
 if not google_creds_json:
     raise ValueError("Не найден секрет GOOGLE_JSON")
 creds_dict = json.loads(google_creds_json)
 
-# Авторизация Google Sheets
 creds = Credentials.from_service_account_info(
     creds_dict,
     scopes=["https://www.googleapis.com/auth/spreadsheets"]
@@ -52,10 +51,10 @@ questions = [
 
 ASKING, CONFIRM, EDITING = range(3)
 
-# ===== Функции =====
+# ===== Вспомогательные =====
 def next_available_number(number_prefix):
     rows = sheet.get_all_values()[1:]
-    numbers = [row[2] for row in rows if row]
+    numbers = [row[2] for row in rows if len(row) > 2]
     match = re.match(r"([^\d]*)(\d+)$", number_prefix)
     if match:
         prefix, num = match.groups()
@@ -65,11 +64,23 @@ def next_available_number(number_prefix):
         return f"{prefix}{num}"
     return number_prefix
 
+async def clear_temp_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет все временные сообщения вопросов/ответов."""
+    chat_id = update.effective_chat.id
+    for mid in context.user_data.get("msg_ids", []):
+        try:
+            await context.bot.delete_message(chat_id, mid)
+        except:
+            pass
+    context.user_data["msg_ids"] = []
+
+# ===== Логика =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     context.user_data["answers"] = {}
     context.user_data["idx"] = 0
     context.user_data["msg_ids"] = []
-    msg = await update.message.reply_text(f"Привет! Давай заполним заявку.\n{questions[0]} (если неизвестно, ставь '-')")
+    msg = await update.message.reply_text(f"{questions[0]} (если неизвестно, ставь '-')")
     context.user_data["msg_ids"].append(msg.message_id)
     return ASKING
 
@@ -78,31 +89,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answers = context.user_data["answers"]
     text = update.message.text.strip() or "-"
 
-    # Проверка дубликата номера заявки
+    # Проверка номера заявки
     if questions[idx] == "Номер заявки":
         text = next_available_number(text)
-        msg = await update.message.reply_text(f"Предлагаю использовать доступный номер заявки: {text}")
+        msg = await update.message.reply_text(f"Предлагаю использовать номер заявки: {text}")
         context.user_data["msg_ids"].append(msg.message_id)
 
     answers[questions[idx]] = text
     context.user_data["idx"] = idx + 1
-    msg_id = update.message.message_id
-    context.user_data["msg_ids"].append(msg_id)
+    context.user_data["msg_ids"].append(update.message.message_id)
 
     if context.user_data["idx"] < len(questions):
         msg = await update.message.reply_text(f"{questions[context.user_data['idx']]} (если неизвестно, ставь '-')")
         context.user_data["msg_ids"].append(msg.message_id)
         return ASKING
     else:
-        # Удаляем все сообщения с вопросами
-        for mid in context.user_data.get("msg_ids", []):
-            try:
-                await update.message.chat.delete_message(mid)
-            except:
-                pass
+        await clear_temp_messages(update, context)
         return await show_summary(update, context)
 
-async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
     data = context.user_data["answers"]
     passengers = data["Пассажиры (через запятую)"].replace(",", "\n")
 
@@ -146,11 +151,22 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✅ Подтвердить", callback_data="confirm")],
         [InlineKeyboardButton("✏️ Редактировать", callback_data="edit")]
     ]
-    msg = await update.message.reply_text(
-        f"📩 СМС менеджеру:\n{sms_manager}\n\n📩 СМС для таблицы:\n{sms_table}",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    context.user_data["summary_msg_id"] = msg.message_id
+
+    if edit and "summary_msg_id" in context.user_data:
+        # обновляем старое сообщение
+        await context.bot.edit_message_text(
+            sms_manager + "\n\n📩 СМС для таблицы:\n" + sms_table,
+            chat_id=update.effective_chat.id,
+            message_id=context.user_data["summary_msg_id"],
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        msg = await update.message.reply_text(
+            f"📩 СМС менеджеру:\n{sms_manager}\n\n📩 СМС для таблицы:\n{sms_table}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        context.user_data["summary_msg_id"] = msg.message_id
+
     return CONFIRM
 
 async def confirm_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -164,13 +180,8 @@ async def confirm_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return ConversationHandler.END
     elif query.data == "edit":
-        keyboard = [
-            [InlineKeyboardButton(q, callback_data=f"edit_{i}")] for i, q in enumerate(questions)
-        ]
-        await query.edit_message_text(
-            "Выберите поле для редактирования:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        keyboard = [[InlineKeyboardButton(q, callback_data=f"edit_{i}")] for i, q in enumerate(questions)]
+        await query.edit_message_text("Выберите поле для редактирования:", reply_markup=InlineKeyboardMarkup(keyboard))
         return CONFIRM
 
 async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -186,7 +197,7 @@ async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip() or "-"
     context.user_data["answers"][questions[idx]] = text
     await update.message.delete()
-    return await show_summary(update, context)
+    return await show_summary(update, context, edit=True)
 
 # ===== Просмотр заявок =====
 async def list_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,9 +205,7 @@ async def list_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("Заявок пока нет.")
         return
-    keyboard = [
-        [InlineKeyboardButton(f"{r[2]} / {r[1]}", callback_data=f"req_{r[2]}")] for r in rows[-10:]
-    ]
+    keyboard = [[InlineKeyboardButton(f"{r[2]} / {r[1]}", callback_data=f"req_{r[2]}")] for r in rows[-10:]]
     await update.message.reply_text("📋 Последние заявки:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -208,16 +217,9 @@ async def show_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if r[2] == num:
             passengers = r[10].replace(",", "\n")
             sms_manager = (
-                f"Заявка № {r[2]}\n"
-                f"Дата: {r[3]}\n"
-                f"Услуга: {r[4]}\n"
-                f"Аэропорт: {r[5]}\n"
-                f"Терминал: {r[6]}\n"
-                f"Направление: {r[7]}\n"
-                f"Рейс: {r[8]}\n"
-                f"Время: {r[9]}\n"
-                f"Пассажиры:\n{passengers}\n\n"
-                f"Сумма к оплате: {r[14]} {r[15]}"
+                f"Заявка № {r[2]}\nДата: {r[3]}\nУслуга: {r[4]}\nАэропорт: {r[5]}\n"
+                f"Терминал: {r[6]}\nНаправление: {r[7]}\nРейс: {r[8]}\nВремя: {r[9]}\n"
+                f"Пассажиры:\n{passengers}\n\nСумма к оплате: {r[14]} {r[15]}"
             )
             sms_table = (
                 f"Manager ID: {r[0]}\nManager: {r[1]}\nЗаявка № {r[2]}\nДата: {r[3]}\n"
@@ -230,7 +232,7 @@ async def show_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"📩 СМС менеджеру:\n{sms_manager}\n\n📩 СМС для таблицы:\n{sms_table}")
             return
 
-# ===== Основное =====
+# ===== Запуск =====
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     conv = ConversationHandler(

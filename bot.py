@@ -13,13 +13,11 @@ from telegram.ext import (
 GOOGLE_SHEET_ID = "1t31GuGFQc-bQpwtlw4cQM6Eynln1r_vbXVo86Yn8k0E"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Загружаем JSON ключ из Secrets
 google_creds_json = os.getenv("GOOGLE_JSON")
 if not google_creds_json:
     raise ValueError("Не найден секрет GOOGLE_JSON")
 creds_dict = json.loads(google_creds_json)
 
-# Авторизация Google Sheets
 creds = Credentials.from_service_account_info(
     creds_dict,
     scopes=["https://www.googleapis.com/auth/spreadsheets"]
@@ -29,61 +27,74 @@ sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
 
 # ========= Вопросы ==========
 questions = [
-    "Номер заявки",
+    "Manager ID",
     "Manager",
-    "Клиент",
-    "Услуга",
+    "Номер заявки",
+    "Дата услуги (ДД.MM.ГГ)",
+    "Тип услуги",
+    "Аэропорт",
+    "Терминал",
+    "Направление",
+    "Номер рейса",
+    "Время рейса (ЧЧ:ММ/ЧЧ:ММ)",
     "Пассажиры (через запятую)",
     "Нетто",
-    "Валюта нетто",
+    "Валюта нетто (RUB, USD, EUR)",
     "Дата оплаты поставщику (ДД.MM.ГГ)",
-    "Комиссия",
-    "Валюта комиссии",
-    "Маржа",
-    "Валюта маржи",
-    "Итого",
-    "Валюта итого",
-    "Дата услуги (ДД.MM.ГГ)",
-    "Дата оплаты клиента (ДД.MM.ГГ)"
+    "Брутто",
+    "Валюта брутто",
+    "Дата оплаты клиентом (ДД.MM.ГГ)",
+    "Способ оплаты клиентом",
+    "Способ оплаты поставщику"
 ]
 
 ASKING, CONFIRM = range(2)
 
-# ========= Функции ==========
+# ========= Вспомогательные функции ==========
+def get_next_available_number(prefix="ДЮ-"):
+    rows = sheet.get_all_values()[1:]
+    numbers = [int(re.search(r"\d+$", r[2]).group()) for r in rows if re.match(rf"{prefix}\d+$", r[2])]
+    return f"{prefix}{max(numbers)+1 if numbers else 1}"
+
+def format_input(text):
+    return text.strip() if text.strip() else "-"
+
+# ========= Handlers ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     context.user_data["answers"] = {}
     context.user_data["idx"] = 0
-    await update.message.reply_text(
-        f"Привет! Давай заполним заявку.\n\n{questions[0]} (если неизвестно, ставь '-')"
-    )
+    msg = await update.message.reply_text(f"{questions[0]} (если неизвестно, ставь '-')")
+    context.user_data["last_msg"] = msg
     return ASKING
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    idx = context.user_data.get("idx", 0)
-    answers = context.user_data.get("answers", {})
-    text = update.message.text.strip()
+    idx = context.user_data["idx"]
+    answers = context.user_data["answers"]
+    text = format_input(update.message.text)
+
+    # Удаляем вопрос после ответа
+    try: await context.user_data["last_msg"].delete()
+    except: pass
+    try: await update.message.delete()
+    except: pass
 
     # Проверка дубликата номера заявки
     if questions[idx] == "Номер заявки":
-        existing_numbers = [row[0] for row in sheet.get_all_values()[1:] if row]
+        rows = sheet.get_all_values()[1:]
+        existing_numbers = [r[2] for r in rows if r]
         if text in existing_numbers:
-            match = re.match(r"([^\d]*)(\d+)$", text)
-            if match:
-                prefix, num = match.groups()
-                suggested = f"{prefix}{int(num) + 1}"
-                await update.message.reply_text(
-                    f"⚠️ Такой номер уже есть в таблице!\nПредлагаю использовать следующий: {suggested}"
-                )
-                text = suggested
+            text = get_next_available_number()
+            msg = await update.message.reply_text(f"⚠️ Такой номер уже есть. Используем следующий: {text}")
+            context.user_data["last_msg"] = msg
 
     answers[questions[idx]] = text
     idx += 1
 
     if idx < len(questions):
         context.user_data["idx"] = idx
-        await update.message.reply_text(
-            f"{questions[idx]} (если неизвестно, ставь '-')"
-        )
+        msg = await update.message.reply_text(f"{questions[idx]} (если неизвестно, ставь '-')")
+        context.user_data["last_msg"] = msg
         return ASKING
     else:
         return await show_summary(update, context)
@@ -92,20 +103,36 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data["answers"]
 
     sms_manager = (
-        f"Заявка {data['Номер заявки']} для клиента {data['Клиент']} "
-        f"услуга {data['Услуга']} дата {data['Дата услуги (ДД.MM.ГГ)']}."
+        f"Заявка № {data['Номер заявки']}\n"
+        f"Дата: {data['Дата услуги (ДД.MM.ГГ)']}\n"
+        f"Услуга: {data['Тип услуги']}\n"
+        f"Аэропорт: {data['Аэропорт']}\n"
+        f"Терминал: {data['Терминал']}\n"
+        f"Направление: {data['Направление']}\n"
+        f"Рейс: {data['Номер рейса']}\n"
+        f"Время: {data['Время рейса (ЧЧ:ММ/ЧЧ:ММ)']}\n"
+        f"Пассажиры:\n{data['Пассажиры (через запятую)'].replace(',', '\n')}\n\n"
+        f"Сумма к оплате: {data['Брутто']} {data['Валюта брутто']}"
     )
 
     sms_table = (
-        f"Заявка {data['Номер заявки']}, менеджер {data['Manager']}, "
-        f"пассажиры: {data['Пассажиры (через запятую)']}, "
-        f"нетто {data['Нетто']} {data['Валюта нетто']}, "
-        f"комиссия {data['Комиссия']} {data['Валюта комиссии']}, "
-        f"маржа {data['Маржа']} {data['Валюта маржи']}, "
-        f"итого {data['Итого']} {data['Валюта итого']}, "
-        f"дата услуги {data['Дата услуги (ДД.MM.ГГ)']}, "
-        f"оплата клиента {data['Дата оплаты клиента (ДД.MM.ГГ)']}, "
-        f"оплата поставщику {data['Дата оплаты поставщику (ДД.MM.ГГ)']}."
+        f"Manager ID: {data['Manager ID']}\n"
+        f"Manager: {data['Manager']}\n"
+        f"Заявка № {data['Номер заявки']}\n"
+        f"Дата: {data['Дата услуги (ДД.MM.ГГ)']}\n"
+        f"Услуга: {data['Тип услуги']}\n"
+        f"Аэропорт: {data['Аэропорт']}\n"
+        f"Терминал: {data['Терминал']}\n"
+        f"Направление: {data['Направление']}\n"
+        f"Рейс: {data['Номер рейса']}\n"
+        f"Время: {data['Время рейса (ЧЧ:ММ/ЧЧ:ММ)']}\n"
+        f"Пассажиры:\n{data['Пассажиры (через запятую)'].replace(',', '\n')}\n\n"
+        f"Брутто: {data['Брутто']} {data['Валюта брутто']}\n"
+        f"Нетто: {data['Нетто']} {data['Валюта нетто (RUB, USD, EUR)']}\n\n"
+        f"Дата оплаты клиентом: {data['Дата оплаты клиентом (ДД.MM.ГГ)']}\n"
+        f"Куда оплатил клиент: {data['Способ оплаты клиентом']}\n"
+        f"Дата оплаты поставщику: {data['Дата оплаты поставщику (ДД.MM.ГГ)']}\n"
+        f"Как оплатили поставщику: {data['Способ оплаты поставщику']}"
     )
 
     context.user_data["sms_manager"] = sms_manager
@@ -115,32 +142,24 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✅ Подтвердить", callback_data="confirm")],
         [InlineKeyboardButton("✏️ Редактировать", callback_data="edit")]
     ]
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         f"📩 СМС менеджеру:\n{sms_manager}\n\n📩 СМС в таблицу:\n{sms_table}",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+    context.user_data["last_msg"] = msg
     return CONFIRM
 
 async def confirm_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.data == "confirm":
-        data = context.user_data["answers"]
-        row = [data[q] for q in questions]
+        row = [context.user_data["answers"].get(q, "-") for q in questions]
         sheet.append_row(row)
         await query.edit_message_text("✅ Заявка сохранена и отправлена в таблицу.")
         return ConversationHandler.END
-
     elif query.data == "edit":
-        keyboard = [
-            [InlineKeyboardButton(q, callback_data=f"edit_{i}")]
-            for i, q in enumerate(questions)
-        ]
-        await query.edit_message_text(
-            "Что хочешь отредактировать?",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        keyboard = [[InlineKeyboardButton(q, callback_data=f"edit_{i}")] for i, q in enumerate(questions)]
+        await query.edit_message_text("Что хочешь отредактировать?", reply_markup=InlineKeyboardMarkup(keyboard))
         return CONFIRM
 
 async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -148,13 +167,15 @@ async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     idx = int(query.data.split("_")[1])
     context.user_data["edit_idx"] = idx
-    await query.edit_message_text(f"Введи новое значение для: {questions[idx]}")
+    msg = await query.edit_message_text(f"Введи новое значение для: {questions[idx]} (если неизвестно, ставь '-')")
+    context.user_data["last_msg"] = msg
     return ASKING
 
 async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     idx = context.user_data.get("edit_idx")
     if idx is not None:
-        context.user_data["answers"][questions[idx]] = update.message.text.strip()
+        text = format_input(update.message.text)
+        context.user_data["answers"][questions[idx]] = text
     return await show_summary(update, context)
 
 # ===== Просмотр предыдущих заявок =====
@@ -163,37 +184,30 @@ async def list_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("Заявок пока нет.")
         return
-
-    keyboard = []
-    for r in rows[-10:]:
-        num, mgr, *_ , date = r[0], r[1], *r[2:], r[14]
-        keyboard.append([InlineKeyboardButton(f"{num} / {mgr} / {date}", callback_data=f"req_{num}")])
-
-    await update.message.reply_text(
-        "📋 Последние заявки:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    keyboard = [[InlineKeyboardButton(f"{r[2]} / {r[1]}", callback_data=f"req_{r[2]}")] for r in rows[-10:]]
+    await update.message.reply_text("📋 Последние заявки:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    num = query.data.split("_", 1)[1]
+    num = query.data.split("_")[1]
     rows = sheet.get_all_values()[1:]
     for r in rows:
-        if r[0] == num:
+        if r[2] == num:
             sms_manager = (
-                f"Заявка {r[0]} для клиента {r[2]} услуга {r[3]} дата {r[14]}."
+                f"Заявка № {r[2]}\nДата: {r[3]}\nУслуга: {r[4]}\nАэропорт: {r[5]}\n"
+                f"Терминал: {r[6]}\nНаправление: {r[7]}\nРейс: {r[8]}\nВремя: {r[9]}\n"
+                f"Пассажиры:\n{r[10].replace(',', '\n')}\n\nСумма к оплате: {r[15]} {r[16]}"
             )
             sms_table = (
-                f"Заявка {r[0]}, менеджер {r[1]}, пассажиры: {r[4]}, "
-                f"нетто {r[5]} {r[6]}, комиссия {r[8]} {r[9]}, "
-                f"маржа {r[10]} {r[11]}, итого {r[12]} {r[13]}, "
-                f"дата услуги {r[14]}, оплата клиента {r[15]}, "
-                f"оплата поставщику {r[7]}."
+                f"Manager ID: {r[0]}\nManager: {r[1]}\nЗаявка № {r[2]}\nДата: {r[3]}\n"
+                f"Услуга: {r[4]}\nАэропорт: {r[5]}\nТерминал: {r[6]}\nНаправление: {r[7]}\n"
+                f"Рейс: {r[8]}\nВремя: {r[9]}\nПассажиры:\n{r[10].replace(',', '\n')}\n\n"
+                f"Брутто: {r[15]} {r[16]}\nНетто: {r[11]} {r[12]}\n"
+                f"Дата оплаты клиентом: {r[17]}\nКуда оплатил клиент: {r[18]}\n"
+                f"Дата оплаты поставщику: {r[13]}\nКак оплатили поставщику: {r[19]}"
             )
-            await query.edit_message_text(
-                f"📩 СМС менеджеру:\n{sms_manager}\n\n📩 СМС в таблицу:\n{sms_table}"
-            )
+            await query.edit_message_text(f"📩 СМС менеджеру:\n{sms_manager}\n\n📩 СМС в таблицу:\n{sms_table}")
             return
 
 # ========= Основное ==========
@@ -213,13 +227,12 @@ def main():
             ]
         },
         fallbacks=[CommandHandler("start", start)],
-        per_message=True  # 👈 добавлено для устранения предупреждения
+        per_message=True
     )
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("list", list_requests))
     app.add_handler(CallbackQueryHandler(show_request, pattern="^req_"))
-
     app.run_polling()
 
 if __name__ == "__main__":
